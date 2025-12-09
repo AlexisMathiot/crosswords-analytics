@@ -1,5 +1,7 @@
 """Application configuration using Pydantic Settings."""
 
+from functools import cached_property
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,15 +32,13 @@ class Settings(BaseSettings):
     api_description: str = "Statistics and analytics service for crosswords application"
     debug: bool = False
 
-    # CORS
-    cors_origins: list[str] = [
-        "http://localhost",
-        "http://localhost:80",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:8000",
-        "https://crosswords-mvp-analytics.vercel.app",
-    ]
+    # CORS (comma-separated string)
+    cors_origins_str: str = "http://localhost,http://localhost:80,http://localhost:3000,http://localhost:5173,http://localhost:8000,https://crosswords-mvp-analytics.vercel.app"
+
+    @cached_property
+    def cors_origins(self) -> list[str]:
+        """Parse CORS origins from comma-separated string."""
+        return [origin.strip() for origin in self.cors_origins_str.split(",") if origin.strip()]
 
 
 settings = Settings()
