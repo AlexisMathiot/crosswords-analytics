@@ -424,21 +424,48 @@ def calculate_temporal_stats(db: Session, grid_id: int) -> dict:
     }
 
 
-def calculate_global_stats(db: Session) -> dict:
+def calculate_global_stats(
+    db: Session,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
     """Calculate global platform statistics with per-grid breakdown.
 
     Args:
         db: Database session
+        start_date: Optional start date filter (ISO format: YYYY-MM-DD)
+        end_date: Optional end date filter (ISO format: YYYY-MM-DD)
 
     Returns:
         dict: Global statistics including per-grid data
     """
+    from datetime import datetime, timedelta
+
+    # Parse date filters
+    date_filter_start = None
+    date_filter_end = None
+    if start_date:
+        date_filter_start = datetime.fromisoformat(start_date)
+    if end_date:
+        date_filter_end = datetime.fromisoformat(end_date) + timedelta(days=1)
+
     total_users = db.query(func.count(User.id)).scalar()
     total_grids = db.query(func.count(Grid.id)).scalar()
     published_grids = (
         db.query(func.count(Grid.id)).filter(Grid.published_at.isnot(None)).scalar()
     )
-    total_submissions = db.query(func.count(Submission.id)).scalar()
+
+    # Total submissions (with date filter if provided)
+    submissions_count_query = db.query(func.count(Submission.id))
+    if date_filter_start:
+        submissions_count_query = submissions_count_query.filter(
+            Submission.submitted_at >= date_filter_start
+        )
+    if date_filter_end:
+        submissions_count_query = submissions_count_query.filter(
+            Submission.submitted_at < date_filter_end
+        )
+    total_submissions = submissions_count_query.scalar()
 
     # Fetch per-grid statistics
     grids_query = (
@@ -450,10 +477,23 @@ def calculate_global_stats(db: Session) -> dict:
             Submission.total_words,
             Submission.joker_used,
             Submission.completion_time_seconds,
+            Submission.submitted_at,
         )
         .outerjoin(Submission, Grid.id == Submission.grid_id)
         .filter(Grid.published_at.isnot(None))
     )
+
+    # Apply date filters to submissions
+    if date_filter_start:
+        grids_query = grids_query.filter(
+            (Submission.submitted_at >= date_filter_start)
+            | (Submission.submitted_at.is_(None))
+        )
+    if date_filter_end:
+        grids_query = grids_query.filter(
+            (Submission.submitted_at < date_filter_end)
+            | (Submission.submitted_at.is_(None))
+        )
 
     # Convert to DataFrame for analysis
     df = pd.read_sql(grids_query.statement, db.bind)

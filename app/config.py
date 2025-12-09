@@ -13,9 +13,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database
+    # Database (MariaDB)
     database_url: str = (
-        "postgresql://crossword:crosswords_password@localhost:5432/crossword_db"
+        "mysql+pymysql://crossword:crosswords_password@localhost:3306/crossword_db"
     )
 
     # Redis

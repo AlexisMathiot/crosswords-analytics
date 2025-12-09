@@ -158,17 +158,49 @@ async def get_temporal_statistics(grid_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/global")
-async def get_global_statistics(db: Session = Depends(get_db)):
+async def get_global_statistics(
+    db: Session = Depends(get_db),
+    start_date: str | None = None,
+    end_date: str | None = None,
+    period: str | None = None,
+):
     """Get global platform statistics across all grids.
 
     Args:
         db: Database session
+        start_date: Optional start date filter (ISO format: YYYY-MM-DD)
+        end_date: Optional end date filter (ISO format: YYYY-MM-DD)
+        period: Optional preset period (week, month, year, all)
 
     Returns:
         dict: Global statistics including total users, grids, submissions, etc.
     """
+    from datetime import datetime, timedelta
+
+    # Handle preset periods
+    if period:
+        today = datetime.now().date()
+        if period == "week":
+            start_date = (today - timedelta(days=7)).isoformat()
+            end_date = today.isoformat()
+        elif period == "month":
+            start_date = (today - timedelta(days=30)).isoformat()
+            end_date = today.isoformat()
+        elif period == "year":
+            start_date = (today - timedelta(days=365)).isoformat()
+            end_date = today.isoformat()
+        elif period == "all":
+            start_date = None
+            end_date = None
+
     try:
-        stats = statistics_service.calculate_global_stats(db)
+        stats = statistics_service.calculate_global_stats(db, start_date, end_date)
+        # Add period info to response
+        stats["period"] = {
+            "type": period or "custom" if (start_date or end_date) else "all",
+            "startDate": start_date,
+            "endDate": end_date,
+        }
         return stats
     except Exception as e:
         raise HTTPException(
