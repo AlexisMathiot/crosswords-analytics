@@ -4,9 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Grid
 from app.services import statistics_service
-from app.services.statistics_service import extract_grid_number
 
 router = APIRouter()
 
@@ -15,21 +13,16 @@ router = APIRouter()
 async def get_available_grids(db: Session = Depends(get_db)):
     """Get list of available grids.
 
+    Returns only one grid per family (parent + revisions).
+    When a grid has revisions, only the most recent (revision) is shown.
+
     Args:
         db: Database session
 
     Returns:
         list: List of grids with id, gridNumber, and version
     """
-    grids = db.query(Grid.id, Grid.version).order_by(Grid.id).all()
-    return [
-        {
-            "id": grid_id,
-            "gridNumber": extract_grid_number(version),
-            "version": version,
-        }
-        for grid_id, version in grids
-    ]
+    return statistics_service.get_available_grids(db)
 
 
 @router.get("/grid/{grid_id}")

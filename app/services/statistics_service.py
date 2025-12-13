@@ -26,12 +26,111 @@ def extract_grid_number(version: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def calculate_grid_stats(db: Session, grid_id: int) -> dict:
-    """Calculate comprehensive statistics for a grid using Pandas.
+def get_grid_family(db: Session, grid_id: int) -> tuple[Grid, list[int]]:
+    """Get the grid family (parent + all revisions) for aggregated statistics.
+
+    When a grid is a revision, we aggregate statistics from the parent and all its
+    revisions. The most recent grid (revision) is returned as the representative grid.
 
     Args:
         db: Database session
-        grid_id: Grid identifier
+        grid_id: Any grid ID (parent or revision)
+
+    Returns:
+        tuple: (representative_grid, list_of_all_grid_ids)
+            - representative_grid: The most recent grid in the family (for display info)
+            - list_of_all_grid_ids: All grid IDs whose submissions should be aggregated
+
+    Raises:
+        ValueError: If grid not found
+    """
+    grid = db.query(Grid).filter(Grid.id == grid_id).first()
+    if not grid:
+        raise ValueError(f"Grid {grid_id} not found")
+
+    # Determine the root parent ID
+    if grid.is_revision and grid.parent_grid_id:
+        parent_id = grid.parent_grid_id
+    else:
+        parent_id = grid.id
+
+    # Find all grids in this family (parent + all revisions)
+    family_grids = (
+        db.query(Grid)
+        .filter((Grid.id == parent_id) | (Grid.parent_grid_id == parent_id))
+        .all()
+    )
+
+    # Get all grid IDs
+    family_ids = [g.id for g in family_grids]
+
+    # Find the most recent grid (by published_at or created_at) for display
+    # Revisions are more recent, so prefer them
+    representative_grid = max(
+        family_grids,
+        key=lambda g: (g.is_revision, g.published_at or g.created_at or g.id),
+    )
+
+    return representative_grid, family_ids
+
+
+def get_available_grids(db: Session) -> list[dict]:
+    """Get list of available grids, showing only one grid per family.
+
+    When a grid has revisions, only the most recent (revision) is returned.
+    Parent grids that have revisions are hidden from the list.
+
+    Args:
+        db: Database session
+
+    Returns:
+        list: List of grid info dicts with id, gridNumber, version
+    """
+    # Get all grids
+    all_grids = db.query(Grid).order_by(Grid.id).all()
+
+    # Group grids by family root
+    families: dict[int, list[Grid]] = {}
+    for grid in all_grids:
+        # Determine family root
+        if grid.is_revision and grid.parent_grid_id:
+            root_id = grid.parent_grid_id
+        else:
+            root_id = grid.id
+
+        if root_id not in families:
+            families[root_id] = []
+        families[root_id].append(grid)
+
+    # For each family, pick the representative grid (most recent)
+    result = []
+    for family_grids in families.values():
+        representative = max(
+            family_grids,
+            key=lambda g: (g.is_revision, g.published_at or g.created_at or g.id),
+        )
+        result.append(
+            {
+                "id": representative.id,
+                "gridNumber": extract_grid_number(representative.version),
+                "version": representative.version,
+            }
+        )
+
+    # Sort by gridNumber then by id
+    result.sort(key=lambda x: (x["gridNumber"] or 0, x["id"]))
+
+    return result
+
+
+def calculate_grid_stats(db: Session, grid_id: int) -> dict:
+    """Calculate comprehensive statistics for a grid using Pandas.
+
+    Statistics are aggregated across the grid family (parent + all revisions).
+
+    Args:
+        db: Database session
+        grid_id: Grid identifier (can be parent or any revision)
 
     Returns:
         dict: Comprehensive grid statistics
@@ -39,12 +138,10 @@ def calculate_grid_stats(db: Session, grid_id: int) -> dict:
     Raises:
         ValueError: If grid not found
     """
-    # Verify grid exists
-    grid = db.query(Grid).filter(Grid.id == grid_id).first()
-    if not grid:
-        raise ValueError(f"Grid {grid_id} not found")
+    # Get the grid family for aggregation
+    grid, family_ids = get_grid_family(db, grid_id)
 
-    # Fetch all submissions for this grid
+    # Fetch all submissions for the entire grid family
     submissions_query = (
         db.query(
             Submission.id,
@@ -61,7 +158,7 @@ def calculate_grid_stats(db: Session, grid_id: int) -> dict:
             User.pseudo,
         )
         .join(User, Submission.user_id == User.id)
-        .filter(Submission.grid_id == grid_id)
+        .filter(Submission.grid_id.in_(family_ids))
     )
 
     # Convert to pandas DataFrame for fast analysis
@@ -69,7 +166,7 @@ def calculate_grid_stats(db: Session, grid_id: int) -> dict:
 
     if df.empty:
         return {
-            "gridId": grid_id,
+            "gridId": grid.id,
             "gridNumber": extract_grid_number(grid.version),
             "gridVersion": grid.version,
             "totalPlayers": 0,
@@ -121,7 +218,7 @@ def calculate_grid_stats(db: Session, grid_id: int) -> dict:
     # Joker usage statistics
     joker_used_count = int(df["joker_used"].sum())
     with_joker = df[df["joker_used"]]
-    without_joker = df[df["joker_used"]]
+    without_joker = df[~df["joker_used"]]
 
     avg_with_joker = with_joker["final_score"].mean() if len(with_joker) > 0 else None
     avg_without_joker = (
@@ -148,7 +245,7 @@ def calculate_grid_stats(db: Session, grid_id: int) -> dict:
     }
 
     return {
-        "gridId": grid_id,
+        "gridId": grid.id,
         "gridNumber": extract_grid_number(grid.version),
         "gridVersion": grid.version,
         "totalPlayers": total_players,
@@ -164,9 +261,11 @@ def calculate_grid_stats(db: Session, grid_id: int) -> dict:
 def get_leaderboard(db: Session, grid_id: int, limit: int = 100) -> list[dict]:
     """Get leaderboard for a grid.
 
+    Leaderboard is aggregated across the grid family (parent + all revisions).
+
     Args:
         db: Database session
-        grid_id: Grid identifier
+        grid_id: Grid identifier (can be parent or any revision)
         limit: Maximum number of results
 
     Returns:
@@ -175,10 +274,8 @@ def get_leaderboard(db: Session, grid_id: int, limit: int = 100) -> list[dict]:
     Raises:
         ValueError: If grid not found
     """
-    # Verify grid exists
-    grid = db.query(Grid).filter(Grid.id == grid_id).first()
-    if not grid:
-        raise ValueError(f"Grid {grid_id} not found")
+    # Get the grid family for aggregation
+    _grid, family_ids = get_grid_family(db, grid_id)
 
     # Fetch submissions ordered by score (desc) and time (asc)
     query = (
@@ -192,7 +289,7 @@ def get_leaderboard(db: Session, grid_id: int, limit: int = 100) -> list[dict]:
             User.pseudo,
         )
         .join(User, Submission.user_id == User.id)
-        .filter(Submission.grid_id == grid_id)
+        .filter(Submission.grid_id.in_(family_ids))
         .order_by(
             Submission.final_score.desc(), Submission.completion_time_seconds.asc()
         )
@@ -235,9 +332,11 @@ def get_leaderboard(db: Session, grid_id: int, limit: int = 100) -> list[dict]:
 def get_score_distribution(db: Session, grid_id: int, num_bins: int = 20) -> dict:
     """Get score distribution for histogram visualization.
 
+    Distribution is aggregated across the grid family (parent + all revisions).
+
     Args:
         db: Database session
-        grid_id: Grid identifier
+        grid_id: Grid identifier (can be parent or any revision)
         num_bins: Number of bins for histogram
 
     Returns:
@@ -246,14 +345,14 @@ def get_score_distribution(db: Session, grid_id: int, num_bins: int = 20) -> dic
     Raises:
         ValueError: If grid not found
     """
-    # Verify grid exists
-    grid = db.query(Grid).filter(Grid.id == grid_id).first()
-    if not grid:
-        raise ValueError(f"Grid {grid_id} not found")
+    # Get the grid family for aggregation
+    _grid, family_ids = get_grid_family(db, grid_id)
 
-    # Fetch scores
+    # Fetch scores from all grids in the family
     scores = (
-        db.query(Submission.final_score).filter(Submission.grid_id == grid_id).all()
+        db.query(Submission.final_score)
+        .filter(Submission.grid_id.in_(family_ids))
+        .all()
     )
 
     if not scores:
@@ -285,9 +384,11 @@ def get_completion_time_distribution(
 ) -> dict:
     """Get completion time distribution for histogram visualization.
 
+    Distribution is aggregated across the grid family (parent + all revisions).
+
     Args:
         db: Database session
-        grid_id: Grid identifier
+        grid_id: Grid identifier (can be parent or any revision)
         num_bins: Number of bins for histogram
 
     Returns:
@@ -296,15 +397,13 @@ def get_completion_time_distribution(
     Raises:
         ValueError: If grid not found
     """
-    # Verify grid exists
-    grid = db.query(Grid).filter(Grid.id == grid_id).first()
-    if not grid:
-        raise ValueError(f"Grid {grid_id} not found")
+    # Get the grid family for aggregation
+    _grid, family_ids = get_grid_family(db, grid_id)
 
-    # Fetch completion times
+    # Fetch completion times from all grids in the family
     times = (
         db.query(Submission.completion_time_seconds)
-        .filter(Submission.grid_id == grid_id)
+        .filter(Submission.grid_id.in_(family_ids))
         .all()
     )
 
@@ -336,9 +435,11 @@ def get_completion_time_distribution(
 def calculate_temporal_stats(db: Session, grid_id: int) -> dict:
     """Calculate temporal statistics for a grid (submission times analysis).
 
+    Statistics are aggregated across the grid family (parent + all revisions).
+
     Args:
         db: Database session
-        grid_id: Grid identifier
+        grid_id: Grid identifier (can be parent or any revision)
 
     Returns:
         dict: Temporal statistics including:
@@ -350,14 +451,12 @@ def calculate_temporal_stats(db: Session, grid_id: int) -> dict:
     Raises:
         ValueError: If grid not found
     """
-    # Verify grid exists
-    grid = db.query(Grid).filter(Grid.id == grid_id).first()
-    if not grid:
-        raise ValueError(f"Grid {grid_id} not found")
+    # Get the grid family for aggregation
+    grid, family_ids = get_grid_family(db, grid_id)
 
-    # Fetch all submissions with timestamps
+    # Fetch all submissions with timestamps from the grid family
     submissions_query = db.query(Submission.submitted_at).filter(
-        Submission.grid_id == grid_id
+        Submission.grid_id.in_(family_ids)
     )
 
     # Convert to pandas DataFrame
@@ -365,7 +464,7 @@ def calculate_temporal_stats(db: Session, grid_id: int) -> dict:
 
     if df.empty:
         return {
-            "gridId": grid_id,
+            "gridId": grid.id,
             "gridNumber": extract_grid_number(grid.version),
             "gridVersion": grid.version,
             "totalSubmissions": 0,
@@ -429,7 +528,7 @@ def calculate_temporal_stats(db: Session, grid_id: int) -> dict:
     )
 
     return {
-        "gridId": grid_id,
+        "gridId": grid.id,
         "gridNumber": extract_grid_number(grid.version),
         "gridVersion": grid.version,
         "totalSubmissions": total_submissions,
@@ -451,6 +550,9 @@ def calculate_global_stats(
 ) -> dict:
     """Calculate global platform statistics with per-grid breakdown.
 
+    Grids are grouped by family (parent + revisions). Only the most recent grid
+    in each family is displayed, with aggregated statistics from all family members.
+
     Args:
         db: Database session
         start_date: Optional start date filter (ISO format: YYYY-MM-DD)
@@ -470,10 +572,20 @@ def calculate_global_stats(
         date_filter_end = datetime.fromisoformat(end_date) + timedelta(days=1)
 
     total_users = db.query(func.count(User.id)).scalar()
-    total_grids = db.query(func.count(Grid.id)).scalar()
-    published_grids = (
-        db.query(func.count(Grid.id)).filter(Grid.published_at.isnot(None)).scalar()
-    )
+
+    # Count grid families (parent + revisions = 1 family)
+    # A family root is either a non-revision grid, or the parent_grid_id of a revision
+    all_grids = db.query(Grid).all()
+    family_roots = set()
+    published_family_roots = set()
+    for grid in all_grids:
+        root_id = grid.parent_grid_id if grid.is_revision and grid.parent_grid_id else grid.id
+        family_roots.add(root_id)
+        if grid.published_at is not None:
+            published_family_roots.add(root_id)
+
+    total_grids = len(family_roots)
+    published_grids = len(published_family_roots)
 
     # Total submissions (with date filter if provided)
     submissions_count_query = db.query(func.count(Submission.id))
@@ -487,11 +599,15 @@ def calculate_global_stats(
         )
     total_submissions = submissions_count_query.scalar()
 
-    # Fetch per-grid statistics
+    # Fetch per-grid statistics with parent_grid_id and is_revision for family grouping
     grids_query = (
         db.query(
             Grid.id,
             Grid.version,
+            Grid.parent_grid_id,
+            Grid.is_revision,
+            Grid.published_at,
+            Grid.created_at,
             Submission.grid_id,
             Submission.words_found,
             Submission.total_words,
@@ -520,40 +636,64 @@ def calculate_global_stats(
 
     grids_stats = []
     if not df.empty and "grid_id" in df.columns:
-        # Group by grid
-        for grid_id in df["id"].unique():
-            grid_df = df[df["id"] == grid_id]
-            grid_submissions = grid_df[grid_df["grid_id"].notna()]
+        # Determine the family root for each grid
+        # If is_revision and has parent_grid_id, use parent_grid_id; otherwise use id
+        df["family_root"] = df.apply(
+            lambda row: row["parent_grid_id"]
+            if row["is_revision"] and pd.notna(row["parent_grid_id"])
+            else row["id"],
+            axis=1,
+        )
 
-            if len(grid_submissions) > 0:
+        # Get unique family roots
+        family_roots = df["family_root"].unique()
+
+        for family_root in family_roots:
+            # Get all grids in this family
+            family_df = df[df["family_root"] == family_root]
+
+            # Find the representative grid (most recent: prefer revision, then by date)
+            family_grids_info = family_df[
+                ["id", "version", "is_revision", "published_at", "created_at"]
+            ].drop_duplicates()
+            representative = family_grids_info.sort_values(
+                by=["is_revision", "published_at", "created_at", "id"],
+                ascending=[False, False, False, False],
+            ).iloc[0]
+
+            # Get all submissions for the family
+            family_submissions = family_df[family_df["grid_id"].notna()]
+
+            if len(family_submissions) > 0:
                 # Calculate completion rate
                 completed = (
-                    grid_submissions["words_found"] == grid_submissions["total_words"]
+                    family_submissions["words_found"]
+                    == family_submissions["total_words"]
                 ).sum()
-                completion_rate = (completed / len(grid_submissions)) * 100
+                completion_rate = (completed / len(family_submissions)) * 100
 
                 # Calculate joker usage rate
-                joker_used_count = grid_submissions["joker_used"].sum()
-                joker_rate = (joker_used_count / len(grid_submissions)) * 100
+                joker_used_count = family_submissions["joker_used"].sum()
+                joker_rate = (joker_used_count / len(family_submissions)) * 100
 
                 # Get total words for this grid (same for all submissions)
-                total_words = int(grid_submissions["total_words"].iloc[0])
+                total_words = int(family_submissions["total_words"].iloc[0])
 
                 # Calculate average words found
-                avg_words_found = grid_submissions["words_found"].mean()
+                avg_words_found = family_submissions["words_found"].mean()
 
                 # Calculate median completion time
-                median_time = grid_submissions["completion_time_seconds"].median()
+                median_time = family_submissions["completion_time_seconds"].median()
 
-                # Get grid version
-                grid_version = str(grid_df["version"].iloc[0])
+                # Get grid version from representative
+                grid_version = str(representative["version"])
 
                 grids_stats.append(
                     {
-                        "gridId": int(grid_id),
+                        "gridId": int(representative["id"]),
                         "gridNumber": extract_grid_number(grid_version),
                         "gridVersion": grid_version,
-                        "totalPlayers": int(len(grid_submissions)),
+                        "totalPlayers": int(len(family_submissions)),
                         "completionRate": round(float(completion_rate), 1),
                         "jokerUsageRate": round(float(joker_rate), 1),
                         "totalWords": total_words,
@@ -562,11 +702,11 @@ def calculate_global_stats(
                     }
                 )
             else:
-                # Grid without submissions
-                grid_version = str(grid_df["version"].iloc[0])
+                # Family without submissions - use representative grid info
+                grid_version = str(representative["version"])
                 grids_stats.append(
                     {
-                        "gridId": int(grid_id),
+                        "gridId": int(representative["id"]),
                         "gridNumber": extract_grid_number(grid_version),
                         "gridVersion": grid_version,
                         "totalPlayers": 0,
@@ -578,16 +718,20 @@ def calculate_global_stats(
                     }
                 )
 
-    # Sort by gridId
-    grids_stats.sort(key=lambda x: x["gridId"])
+    # Sort by gridNumber (grid families)
+    grids_stats.sort(key=lambda x: (x["gridNumber"] or 0, x["gridId"]))
+
+    # Count unique grid families (not individual grids)
+    unique_families = len(grids_stats)
 
     return {
         "totalUsers": total_users,
         "totalGrids": total_grids,
         "publishedGrids": published_grids,
+        "uniqueGridFamilies": unique_families,
         "totalSubmissions": total_submissions,
-        "averageSubmissionsPerGrid": round(total_submissions / total_grids, 2)
-        if total_grids > 0
+        "averageSubmissionsPerGrid": round(total_submissions / unique_families, 2)
+        if unique_families > 0
         else 0,
         "gridStats": grids_stats,
     }
